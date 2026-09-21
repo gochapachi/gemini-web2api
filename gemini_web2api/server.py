@@ -485,11 +485,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            valid_tool_names = []
+            for t in tools:
+                fn = t.get("function", t) if t.get("type") == "function" else t
+                name = fn.get("name", t.get("name", ""))
+                if name:
+                    valid_tool_names.append(name)
+            text, tool_calls = parse_tool_calls(text, valid_tool_names=valid_tool_names)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
         finish = "tool_calls" if tool_calls else "stop"
+
+        completion_len = len(text or "")
+        if tool_calls:
+            completion_len += sum(len(tc.get("function", {}).get("arguments", "")) for tc in tool_calls)
 
         if stream:
             self._start_sse()
@@ -503,8 +513,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
+                "usage": {"prompt_tokens": max(1, len(prompt)//4),
+                          "completion_tokens": max(1, completion_len//4),
+                          "total_tokens": max(1, (len(prompt)+completion_len)//4)},
             })
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────

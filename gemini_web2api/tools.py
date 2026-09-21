@@ -124,7 +124,10 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "When calling tools, output ONLY the tool_call block(s).\n\n"
+                "When calling tools, output ONLY the tool_call block(s).\n"
+                "CRITICAL RULES FOR TOOLS:\n"
+                "1. ONLY call tools that are listed in Available tools below. NEVER invent or hallucinate new tool names (e.g. do not invent format_final_json_response).\n"
+                "2. When you have completed all tool calls and are ready to present the final answer to the user, output your answer directly as text (or JSON if requested), NEVER wrap the final answer inside a tool_call block.\n\n"
                 f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
                 f"{constraint}"
             )
@@ -168,29 +171,134 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     return prompt, images
 
 
-def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
+def _repair_json(raw: str):
+    """Safely parse JSON from model output, fixing unescaped newlines and common formatting issues."""
+    raw = raw.strip()
+    # 1. Try standard parsing with strict=False (handles unescaped control characters)
+    try:
+        return json.loads(raw, strict=False)
+    except Exception:
+        pass
+
+    # 2. Try removing trailing commas
+    cleaned = re.sub(r',\s*([\}\]])', r'\1', raw)
+    try:
+        return json.loads(cleaned, strict=False)
+    except Exception:
+        pass
+
+    # 3. Escape literal newlines/tabs inside quotes
+    def escape_newlines_in_strings(s):
+        result = []
+        in_string = False
+        escaped = False
+        for c in s:
+            if c == '"' and not escaped:
+                in_string = not in_string
+                result.append(c)
+            elif c == '\\' and not escaped:
+                escaped = True
+                result.append(c)
+            elif c == '\n' and in_string:
+                result.append('\\n')
+            elif c == '\r' and in_string:
+                result.append('\\r')
+            elif c == '\t' and in_string:
+                result.append('\\t')
+            else:
+                result.append(c)
+            if c != '\\':
+                escaped = False
+        return "".join(result)
+
+    try:
+        return json.loads(escape_newlines_in_strings(raw), strict=False)
+    except Exception:
+        pass
+
+    # 4. Fallback regex extraction for {"name": "...", "arguments": ...} or {"name": "...", "args": ...}
+    name_m = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
+    if name_m:
+        name = name_m.group(1)
+        args_m = re.search(r'"(?:arguments|args)"\s*:\s*(\{.*\}|\[.*\]|"[^"]*")', raw, re.DOTALL)
+        if args_m:
+            try:
+                args = json.loads(args_m.group(1), strict=False)
+                return {"name": name, "arguments": args}
+            except Exception:
+                return {"name": name, "arguments": {"input": args_m.group(1)}}
+        return {"name": name, "arguments": {}}
+
+    return None
+
+
+def parse_tool_calls(text: str, valid_tool_names: list = None) -> tuple:
+    """Extract tool_call blocks. Returns (clean_text, tool_calls_list).
+
+    If valid_tool_names is provided, only tools matching valid_tool_names are returned
+    as tool_calls. If the model emitted a pseudo-tool (e.g. format_final_json_response),
+    its arguments are unpacked directly into clean_text as valid JSON content so downstream
+    output parsers receive it cleanly.
+    """
+    if not text:
+        return "", []
+
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
+    pattern = r'```tool_call\s*\n(.*?)(?:\n```|$)'
     clean_parts = []
     last_end = 0
+
+    valid_set = set(valid_tool_names) if valid_tool_names else None
+
     for m in re.finditer(pattern, text, re.DOTALL):
         clean_parts.append(text[last_end:m.start()])
         last_end = m.end()
-        try:
-            data = json.loads(m.group(1).strip())
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
-            pass
+        raw_block = m.group(1).strip()
+        data = _repair_json(raw_block)
+
+        if not data or not isinstance(data, dict) or "name" not in data:
+            # If parsing completely failed, keep raw text so content is never lost
+            clean_parts.append(m.group(0))
+            continue
+
+        fn_name = data["name"]
+        args = data.get("arguments", data.get("args", {}))
+
+        # Check if fn_name is a pseudo-tool or not in valid tools
+        if valid_set is not None and fn_name not in valid_set:
+            # Check for pseudo-tool names like format_final_json_response, final_answer, etc.
+            if any(term in fn_name.lower() for term in ("format", "final", "json", "response", "answer", "output")):
+                if isinstance(args, dict) and "output" in args:
+                    clean_parts.append(json.dumps(args["output"], indent=2, ensure_ascii=False))
+                elif isinstance(args, (dict, list)):
+                    clean_parts.append(json.dumps(args, indent=2, ensure_ascii=False))
+                else:
+                    clean_parts.append(str(args))
+            else:
+                # Unknown tool: keep as text rather than sending an invalid tool call that will crash downstream
+                clean_parts.append(m.group(0))
+            continue
+
+        # Valid tool call
+        if not isinstance(args, str):
+            args_str = json.dumps(args, ensure_ascii=False)
+        else:
+            args_str = args
+
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {
+                "name": fn_name,
+                "arguments": args_str,
+            },
+        })
+
     clean_parts.append(text[last_end:])
     clean = "".join(clean_parts).strip()
+    if not tool_calls and not clean and text.strip():
+        clean = text.strip()
+
     return clean, tool_calls
 
 
@@ -308,37 +416,34 @@ def parse_google_function_calls(text: str) -> tuple:
     """Extract function_call blocks from model output.
 
     Handles 3 formats:
-    1. ```function_call\\n{...}\\n``` (standard)
+    1. ```function_call\\n{...}\\n``` (standard or unclosed)
     2. function_call\\n{...} (without backticks)
     3. Raw JSON with "name" + "args" keys
 
     Returns (clean_text, [{"name": ..., "args": ...}])
     """
+    if not text:
+        return "", []
     function_calls = []
-    pattern1 = r'```function_call\s*\n(.*?)\n```'
+    pattern1 = r'```function_call\s*\n(.*?)(?:\n```|$)'
     pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
     clean = text
     for pattern in [pattern1, pattern2]:
         for match in re.findall(pattern, clean, re.DOTALL):
-            try:
-                data = json.loads(match.strip())
-                if "name" in data:
-                    function_calls.append({
-                        "name": data["name"],
-                        "args": data.get("args", data.get("arguments", {})),
-                    })
-            except (json.JSONDecodeError, KeyError):
-                pass
-        clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
-    if not function_calls and clean.strip().startswith("{"):
-        try:
-            data = json.loads(clean.strip())
-            if "name" in data and ("args" in data or "arguments" in data):
+            data = _repair_json(match.strip())
+            if data and isinstance(data, dict) and "name" in data:
                 function_calls.append({
                     "name": data["name"],
                     "args": data.get("args", data.get("arguments", {})),
                 })
-                clean = ""
-        except (json.JSONDecodeError, KeyError):
-            pass
+        clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
+    if not function_calls and clean.strip().startswith("{"):
+        data = _repair_json(clean.strip())
+        if data and isinstance(data, dict) and "name" in data and ("args" in data or "arguments" in data):
+            function_calls.append({
+                "name": data["name"],
+                "args": data.get("args", data.get("arguments", {})),
+            })
+            clean = ""
     return clean, function_calls
+
