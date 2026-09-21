@@ -13,7 +13,7 @@ from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
-SERVER_VERSION = "1.2.0-tunnel-verified"
+SERVER_VERSION = "2.0.0-clean-models-verified"
 
 # Comprehensive Model Catalogue (Ensures Coolify always returns all models in /v1/models)
 ALL_MODELS = {
@@ -30,6 +30,7 @@ ALL_MODELS = {
     "gemini-2.5-flash": {"mode": 1, "think": 4, "desc": "Legacy alias for Flash"},
     "gemini-2.5-pro": {"mode": 3, "think": 4, "desc": "Legacy alias for Pro"},
 }
+MODELS.clear()
 MODELS.update(ALL_MODELS)
 
 # ─── Reverse Tunnel State ───────────────────────────────────────────────────
