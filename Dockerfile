@@ -3,6 +3,8 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+ARG CACHE_BUST=20260921_1538
+RUN echo "Building fresh gemini_web2api $CACHE_BUST"
 COPY gemini_web2api/ ./gemini_web2api/
 COPY config.example.json ./config.json
 EXPOSE 8081
