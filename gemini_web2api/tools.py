@@ -261,21 +261,39 @@ def _extract_balanced_json_block(text: str, start_pos: int = 0) -> str:
 
 
 def _unpack_nested_input(data):
-    """If data has an 'arguments' or 'args' dict with an 'input' key containing JSON, unpack it."""
+    """If data has an 'arguments' or 'args' dict or string containing JSON, unpack it cleanly."""
     if not isinstance(data, dict):
         return data
     for key in ("arguments", "args"):
-        args = data.get(key)
+        if key not in data:
+            continue
+        args = data[key]
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args, strict=False)
+                if isinstance(parsed, (dict, list)):
+                    args = parsed
+                    data[key] = args
+            except Exception:
+                try:
+                    cleaned = re.sub(r',\s*([\}\]])', r'\1', args)
+                    parsed = json.loads(cleaned, strict=False)
+                    if isinstance(parsed, (dict, list)):
+                        args = parsed
+                        data[key] = args
+                except Exception:
+                    pass
+
         if isinstance(args, dict) and "input" in args and isinstance(args["input"], str):
             try:
                 parsed = json.loads(args["input"], strict=False)
-                if isinstance(parsed, dict):
+                if isinstance(parsed, (dict, list)):
                     data[key] = parsed
             except Exception:
                 try:
                     cleaned_input = re.sub(r',\s*([\}\]])', r'\1', args["input"])
                     parsed = json.loads(cleaned_input, strict=False)
-                    if isinstance(parsed, dict):
+                    if isinstance(parsed, (dict, list)):
                         data[key] = parsed
                 except Exception:
                     pass
@@ -283,7 +301,7 @@ def _unpack_nested_input(data):
 
 
 def _repair_json(raw: str):
-    """Safely parse JSON from model output, fixing unescaped newlines and common formatting issues."""
+    """Safely parse JSON from model output, fixing unescaped newlines, quotes, and common formatting issues."""
     raw = raw.strip()
     # 1. Try standard parsing with strict=False (handles unescaped control characters)
     try:
@@ -304,23 +322,42 @@ def _repair_json(raw: str):
     except Exception:
         pass
 
-    # 4. Fallback extraction for {"name": "...", "arguments": ...} or {"name": "...", "args": ...}
-    name_m = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
+    # 4. Try ast.literal_eval for Python dict literals (single quotes)
+    try:
+        import ast
+        eval_res = ast.literal_eval(raw)
+        if isinstance(eval_res, dict):
+            return _unpack_nested_input(eval_res)
+    except Exception:
+        pass
+
+    # 5. Fallback extraction for {"name": "...", "arguments": ...} or {"name": "...", "args": ...}
+    name_m = re.search(r'["\']name["\']\s*:\s*["\']([^"\']+)["\']', raw)
     if name_m:
         name = name_m.group(1)
-        args_m = re.search(r'"(?:arguments|args)"\s*:\s*', raw)
+        args_m = re.search(r'["\'](?:arguments|args)["\']\s*:\s*', raw)
         if args_m:
             block = _extract_balanced_json_block(raw, args_m.end())
             if block:
-                try:
-                    args = json.loads(block, strict=False)
-                    return _unpack_nested_input({"name": name, "arguments": args})
-                except Exception:
+                for attempt_str in (
+                    block,
+                    re.sub(r',\s*([\}\]])', r'\1', block),
+                    _escape_newlines_in_strings(block),
+                    re.sub(r',\s*([\}\]])', r'\1', _escape_newlines_in_strings(block)),
+                ):
                     try:
-                        args = json.loads(_escape_newlines_in_strings(block), strict=False)
+                        args = json.loads(attempt_str, strict=False)
                         return _unpack_nested_input({"name": name, "arguments": args})
                     except Exception:
-                        return _unpack_nested_input({"name": name, "arguments": {"input": block}})
+                        pass
+                try:
+                    import ast
+                    eval_args = ast.literal_eval(block)
+                    if isinstance(eval_args, (dict, list)):
+                        return _unpack_nested_input({"name": name, "arguments": eval_args})
+                except Exception:
+                    pass
+                return _unpack_nested_input({"name": name, "arguments": {"input": block}})
             return {"name": name, "arguments": {}}
         return {"name": name, "arguments": {}}
 
@@ -339,7 +376,7 @@ def parse_tool_calls(text: str, valid_tool_names: list = None) -> tuple:
         return "", []
 
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)(?:\n```|$)'
+    pattern = r'```tool_call\s*(.*?)(?:\n```|```|$)'
     clean_parts = []
     last_end = 0
 
@@ -359,39 +396,34 @@ def parse_tool_calls(text: str, valid_tool_names: list = None) -> tuple:
         fn_name = data["name"]
         args = data.get("arguments", data.get("args", {}))
 
-        # If args is a dict with an "input" key containing a JSON string, attempt to parse it
-        if isinstance(args, dict) and "input" in args and isinstance(args["input"], str):
-            try:
-                parsed = json.loads(args["input"], strict=False)
-                if isinstance(parsed, dict):
-                    args = parsed
-            except Exception:
-                pass
-        elif isinstance(args, str):
-            try:
-                parsed = json.loads(args, strict=False)
-                if isinstance(parsed, dict):
-                    args = parsed
-                    if "input" in args and isinstance(args["input"], str):
-                        try:
-                            nested = json.loads(args["input"], strict=False)
-                            if isinstance(nested, dict):
-                                args = nested
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
         # Check if fn_name is a pseudo-tool or not in valid tools
         if valid_set is not None and fn_name not in valid_set:
             # Check for pseudo-tool names like format_final_json_response, final_answer, etc.
             if any(term in fn_name.lower() for term in ("format", "final", "json", "response", "answer", "output")):
-                if isinstance(args, dict) and "output" in args:
-                    clean_parts.append(json.dumps(args["output"], indent=2, ensure_ascii=False))
-                elif isinstance(args, (dict, list)):
-                    clean_parts.append(json.dumps(args, indent=2, ensure_ascii=False))
+                target = None
+                if isinstance(args, dict):
+                    for k in ("output", "response", "answer", "result", "final_answer"):
+                        if k in args:
+                            target = args[k]
+                            break
+                    if target is None:
+                        target = args
                 else:
-                    clean_parts.append(str(args))
+                    target = args
+
+                if isinstance(target, str):
+                    try:
+                        parsed_t = json.loads(target, strict=False)
+                        if isinstance(parsed_t, (dict, list)):
+                            clean_parts.append(json.dumps(parsed_t, indent=2, ensure_ascii=False))
+                        else:
+                            clean_parts.append(target)
+                    except Exception:
+                        clean_parts.append(target)
+                elif isinstance(target, (dict, list)):
+                    clean_parts.append(json.dumps(target, indent=2, ensure_ascii=False))
+                else:
+                    clean_parts.append(str(target))
             else:
                 # Unknown tool: keep as text rather than sending an invalid tool call that will crash downstream
                 clean_parts.append(m.group(0))
@@ -401,7 +433,11 @@ def parse_tool_calls(text: str, valid_tool_names: list = None) -> tuple:
         if not isinstance(args, str):
             args_str = json.dumps(args, ensure_ascii=False)
         else:
-            args_str = args
+            try:
+                json.loads(args)
+                args_str = args
+            except Exception:
+                args_str = json.dumps({"input": args}, ensure_ascii=False)
 
         tool_calls.append({
             "id": f"call_{uuid.uuid4().hex[:8]}",
@@ -543,24 +579,28 @@ def parse_google_function_calls(text: str) -> tuple:
     if not text:
         return "", []
     function_calls = []
-    pattern1 = r'```function_call\s*\n(.*?)(?:\n```|$)'
+    pattern1 = r'```function_call\s*(.*?)(?:\n```|```|$)'
     pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
     clean = text
     for pattern in [pattern1, pattern2]:
         for match in re.findall(pattern, clean, re.DOTALL):
             data = _repair_json(match.strip())
             if data and isinstance(data, dict) and "name" in data:
+                raw_args = data.get("args", data.get("arguments", {}))
+                args = raw_args if isinstance(raw_args, dict) else {}
                 function_calls.append({
                     "name": data["name"],
-                    "args": data.get("args", data.get("arguments", {})),
+                    "args": args,
                 })
         clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
     if not function_calls and clean.strip().startswith("{"):
         data = _repair_json(clean.strip())
         if data and isinstance(data, dict) and "name" in data and ("args" in data or "arguments" in data):
+            raw_args = data.get("args", data.get("arguments", {}))
+            args = raw_args if isinstance(raw_args, dict) else {}
             function_calls.append({
                 "name": data["name"],
-                "args": data.get("args", data.get("arguments", {})),
+                "args": args,
             })
             clean = ""
     return clean, function_calls

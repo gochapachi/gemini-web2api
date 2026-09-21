@@ -184,6 +184,48 @@ class ToolAndCannedErrorTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["name"], "my_tool")
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"query": "hello"})
 
+    def test_canned_errors_case_insensitive(self):
+        def _make_gemini_raw(text):
+            inner = [None, None, None, None, [["msg_id", [text]]]]
+            inner_str = json.dumps(inner) + " " * 60
+            payload = [["wrb.fr", None, inner_str]]
+            return json.dumps(payload) + " " * 200
+
+        raw = _make_gemini_raw("i seem to be encountering an error. can i try something else for you?")
+        with self.assertRaises(RuntimeError) as ctx:
+            extract_response_text(raw)
+        self.assertIn("Gemini upstream temporary error", str(ctx.exception))
+
+    def test_pseudo_tool_output_not_double_encoded(self):
+        text = '''```tool_call
+{"name": "format_final_json_response", "arguments": {"output": "{\\"pages\\": [{\\"title\\": \\"Home\\"}]}"}}
+```'''
+        clean, calls = parse_tool_calls(text, valid_tool_names=["real_tool"])
+        self.assertEqual(calls, [])
+        parsed = json.loads(clean)
+        self.assertIsInstance(parsed, dict)
+        self.assertIn("pages", parsed)
+
+    def test_repair_json_single_quotes(self):
+        raw = "{'name': 'search_web', 'arguments': {'query': 'python 3.12'}}"
+        res = _repair_json(raw)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["name"], "search_web")
+        self.assertEqual(res["arguments"], {"query": "python 3.12"})
+
+    def test_parse_tool_calls_whitespace_and_no_newline(self):
+        text = '```tool_call {"name": "test_space", "arguments": {"k": "v"}}```'
+        clean, calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "test_space")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"k": "v"})
+
+    def test_unpack_nested_input_stringified_dict(self):
+        raw = '{"name": "test", "arguments": "{\\"input\\": \\"{\\\\\\"nested\\\\\\": 1}\\"}"}'
+        res = _repair_json(raw)
+        self.assertEqual(res["name"], "test")
+        self.assertEqual(res["arguments"], {"nested": 1})
+
 
 class StreamingEndpointTests(unittest.TestCase):
     @classmethod

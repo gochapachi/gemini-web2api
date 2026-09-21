@@ -226,7 +226,7 @@ def extract_response_text(raw: str) -> str:
             if len(t) > len(last_text):
                 last_text = t
     res = clean_text(last_text)
-    if any(err in res for err in CANNED_ERRORS):
+    if any(err.lower() in res.lower() for err in CANNED_ERRORS):
         raise RuntimeError(f"Gemini upstream temporary error: {res}")
     return res
 
@@ -292,7 +292,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
-                            if any(err in t for err in CANNED_ERRORS):
+                            if any(err.lower() in t.lower() for err in CANNED_ERRORS):
                                 raise RuntimeError(f"Gemini upstream temporary error: {t}")
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
