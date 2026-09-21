@@ -28,7 +28,7 @@ if %errorlevel% neq 0 (
 
 :: 3. Start local Gemini-Web2API server in a separate window
 echo [1/2] Starting local Gemini-Web2API server on port 8081...
-start "Gemini Web2API Server [Port 8081]" cmd /k "cd /d "%~dp0" && python gemini_web2api.py --config config.json"
+start "Gemini Web2API Server [Port 8081]" cmd /k "cd /d "%~dp0" && python -m gemini_web2api --config config.json"
 
 :: 4. Wait for local server to initialize
 timeout /t 3 /nobreak >nul

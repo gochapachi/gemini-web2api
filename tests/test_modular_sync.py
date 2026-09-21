@@ -7,9 +7,14 @@ from unittest import mock
 from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload
+from gemini_web2api.gemini import _build_payload, CANNED_ERRORS, extract_response_text
 from gemini_web2api.server import GeminiHandler, ThreadedServer
-from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
+from gemini_web2api.tools import (
+    google_contents_to_prompt,
+    messages_to_prompt,
+    _repair_json,
+    parse_tool_calls,
+)
 
 
 def _decode_payload(payload):
@@ -136,6 +141,48 @@ class MessageParsingTests(unittest.TestCase):
 
         self.assertEqual(prompt, "Describe")
         self.assertEqual(images, [])
+
+
+class ToolAndCannedErrorTests(unittest.TestCase):
+    def test_canned_errors_trigger_runtime_error(self):
+        def _make_gemini_raw(text):
+            inner = [None, None, None, None, [["msg_id", [text]]]]
+            inner_str = json.dumps(inner) + " " * 60
+            payload = [["wrb.fr", None, inner_str]]
+            return json.dumps(payload) + " " * 200
+
+        for err in CANNED_ERRORS:
+            raw = _make_gemini_raw(f"Prefix {err} suffix")
+            with self.assertRaises(RuntimeError) as ctx:
+                extract_response_text(raw)
+            self.assertIn("Gemini upstream temporary error", str(ctx.exception))
+
+    def test_messages_to_prompt_no_format_final_json_response(self):
+        prompt, _ = messages_to_prompt(
+            [{"role": "user", "content": "Hi"}],
+            tools=[{"name": "test_func", "description": "desc", "parameters": {}}],
+        )
+        self.assertNotIn("format_final_json_response", prompt)
+        self.assertIn("ONLY call tools that are listed in Available tools below", prompt)
+
+    def test_repair_json_balanced_block_extraction(self):
+        raw = '{"name": "test_fn", "arguments": {"city": "New York", "details": {"zip": 10001}}}'
+        res = _repair_json(raw)
+        self.assertEqual(res["name"], "test_fn")
+        self.assertEqual(res["arguments"], {"city": "New York", "details": {"zip": 10001}})
+
+    def test_repair_json_nested_input_string_unpacked(self):
+        raw = '{"name": "execute", "arguments": {"input": "{\\"action\\": \\"build\\", \\"count\\": 5}"}}'
+        res = _repair_json(raw)
+        self.assertEqual(res["name"], "execute")
+        self.assertEqual(res["arguments"], {"action": "build", "count": 5})
+
+    def test_parse_tool_calls_with_nested_input(self):
+        text = '```tool_call\n{"name": "my_tool", "arguments": {"input": "{\\"query\\": \\"hello\\"}"}}\n```'
+        clean, calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "my_tool")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"query": "hello"})
 
 
 class StreamingEndpointTests(unittest.TestCase):

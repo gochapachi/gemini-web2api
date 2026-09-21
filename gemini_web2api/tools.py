@@ -126,7 +126,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n"
                 "CRITICAL RULES FOR TOOLS:\n"
-                "1. ONLY call tools that are listed in Available tools below. NEVER invent or hallucinate new tool names (e.g. do not invent format_final_json_response).\n"
+                "1. ONLY call tools that are listed in Available tools below. NEVER invent or hallucinate tool names.\n"
                 "2. When you have completed all tool calls and are ready to present the final answer to the user, output your answer directly as text (or JSON if requested), NEVER wrap the final answer inside a tool_call block.\n\n"
                 f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
                 f"{constraint}"
@@ -171,62 +171,157 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     return prompt, images
 
 
+def _escape_newlines_in_strings(s: str) -> str:
+    result = []
+    in_string = False
+    escaped = False
+    for c in s:
+        if c == '"' and not escaped:
+            in_string = not in_string
+            result.append(c)
+        elif c == '\\' and not escaped:
+            escaped = True
+            result.append(c)
+        elif c == '\n' and in_string:
+            result.append('\\n')
+        elif c == '\r' and in_string:
+            result.append('\\r')
+        elif c == '\t' and in_string:
+            result.append('\\t')
+        else:
+            result.append(c)
+        if c != '\\':
+            escaped = False
+    return "".join(result)
+
+
+def _extract_balanced_json_block(text: str, start_pos: int = 0) -> str:
+    """Extract a balanced JSON object {...}, array [...], or string starting at or after start_pos."""
+    open_idx = -1
+    open_char = ''
+    close_char = ''
+    for i in range(start_pos, len(text)):
+        c = text[i]
+        if c == '{':
+            open_idx = i
+            open_char = '{'
+            close_char = '}'
+            break
+        elif c == '[':
+            open_idx = i
+            open_char = '['
+            close_char = ']'
+            break
+        elif c == '"':
+            open_idx = i
+            open_char = '"'
+            close_char = '"'
+            break
+        elif not c.isspace():
+            break
+
+    if open_idx == -1:
+        return ""
+
+    if open_char == '"':
+        escaped = False
+        for i in range(open_idx + 1, len(text)):
+            c = text[i]
+            if escaped:
+                escaped = False
+            elif c == '\\':
+                escaped = True
+            elif c == '"':
+                return text[open_idx : i + 1]
+        return text[open_idx:]
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(open_idx, len(text)):
+        c = text[i]
+        if escaped:
+            escaped = False
+            continue
+        if c == '\\' and in_string:
+            escaped = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if c == open_char:
+                depth += 1
+            elif c == close_char:
+                depth -= 1
+                if depth == 0:
+                    return text[open_idx : i + 1]
+
+    return text[open_idx:]
+
+
+def _unpack_nested_input(data):
+    """If data has an 'arguments' or 'args' dict with an 'input' key containing JSON, unpack it."""
+    if not isinstance(data, dict):
+        return data
+    for key in ("arguments", "args"):
+        args = data.get(key)
+        if isinstance(args, dict) and "input" in args and isinstance(args["input"], str):
+            try:
+                parsed = json.loads(args["input"], strict=False)
+                if isinstance(parsed, dict):
+                    data[key] = parsed
+            except Exception:
+                try:
+                    cleaned_input = re.sub(r',\s*([\}\]])', r'\1', args["input"])
+                    parsed = json.loads(cleaned_input, strict=False)
+                    if isinstance(parsed, dict):
+                        data[key] = parsed
+                except Exception:
+                    pass
+    return data
+
+
 def _repair_json(raw: str):
     """Safely parse JSON from model output, fixing unescaped newlines and common formatting issues."""
     raw = raw.strip()
     # 1. Try standard parsing with strict=False (handles unescaped control characters)
     try:
-        return json.loads(raw, strict=False)
+        return _unpack_nested_input(json.loads(raw, strict=False))
     except Exception:
         pass
 
     # 2. Try removing trailing commas
     cleaned = re.sub(r',\s*([\}\]])', r'\1', raw)
     try:
-        return json.loads(cleaned, strict=False)
+        return _unpack_nested_input(json.loads(cleaned, strict=False))
     except Exception:
         pass
 
     # 3. Escape literal newlines/tabs inside quotes
-    def escape_newlines_in_strings(s):
-        result = []
-        in_string = False
-        escaped = False
-        for c in s:
-            if c == '"' and not escaped:
-                in_string = not in_string
-                result.append(c)
-            elif c == '\\' and not escaped:
-                escaped = True
-                result.append(c)
-            elif c == '\n' and in_string:
-                result.append('\\n')
-            elif c == '\r' and in_string:
-                result.append('\\r')
-            elif c == '\t' and in_string:
-                result.append('\\t')
-            else:
-                result.append(c)
-            if c != '\\':
-                escaped = False
-        return "".join(result)
-
     try:
-        return json.loads(escape_newlines_in_strings(raw), strict=False)
+        return _unpack_nested_input(json.loads(_escape_newlines_in_strings(raw), strict=False))
     except Exception:
         pass
 
-    # 4. Fallback regex extraction for {"name": "...", "arguments": ...} or {"name": "...", "args": ...}
+    # 4. Fallback extraction for {"name": "...", "arguments": ...} or {"name": "...", "args": ...}
     name_m = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
     if name_m:
         name = name_m.group(1)
-        args_m = re.search(r'"(?:arguments|args)"\s*:\s*(\{.*\}|\[.*\]|"[^"]*")', raw, re.DOTALL)
+        args_m = re.search(r'"(?:arguments|args)"\s*:\s*', raw)
         if args_m:
-            try:
-                args = json.loads(args_m.group(1), strict=False)
-                return {"name": name, "arguments": args}
-            except Exception:
-                return {"name": name, "arguments": {"input": args_m.group(1)}}
+            block = _extract_balanced_json_block(raw, args_m.end())
+            if block:
+                try:
+                    args = json.loads(block, strict=False)
+                    return _unpack_nested_input({"name": name, "arguments": args})
+                except Exception:
+                    try:
+                        args = json.loads(_escape_newlines_in_strings(block), strict=False)
+                        return _unpack_nested_input({"name": name, "arguments": args})
+                    except Exception:
+                        return _unpack_nested_input({"name": name, "arguments": {"input": block}})
+            return {"name": name, "arguments": {}}
         return {"name": name, "arguments": {}}
 
     return None
@@ -263,6 +358,29 @@ def parse_tool_calls(text: str, valid_tool_names: list = None) -> tuple:
 
         fn_name = data["name"]
         args = data.get("arguments", data.get("args", {}))
+
+        # If args is a dict with an "input" key containing a JSON string, attempt to parse it
+        if isinstance(args, dict) and "input" in args and isinstance(args["input"], str):
+            try:
+                parsed = json.loads(args["input"], strict=False)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except Exception:
+                pass
+        elif isinstance(args, str):
+            try:
+                parsed = json.loads(args, strict=False)
+                if isinstance(parsed, dict):
+                    args = parsed
+                    if "input" in args and isinstance(args["input"], str):
+                        try:
+                            nested = json.loads(args["input"], strict=False)
+                            if isinstance(nested, dict):
+                                args = nested
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         # Check if fn_name is a pseudo-tool or not in valid tools
         if valid_set is not None and fn_name not in valid_set:

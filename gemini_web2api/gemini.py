@@ -17,6 +17,17 @@ except ImportError:
 
 from .config import CONFIG
 
+CANNED_ERRORS = (
+    "Sorry, something went wrong",
+    "I seem to be encountering an error",
+    "I'm having a hard time fulfilling your request",
+    "I encountered an error doing what you asked",
+    "Can I try something else for you",
+    "Can I help you with something else instead",
+    "Could you try again?",
+    "I'm unable to help with that right now",
+)
+
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
@@ -215,7 +226,7 @@ def extract_response_text(raw: str) -> str:
             if len(t) > len(last_text):
                 last_text = t
     res = clean_text(last_text)
-    if "Sorry, something went wrong" in res:
+    if any(err in res for err in CANNED_ERRORS):
         raise RuntimeError(f"Gemini upstream temporary error: {res}")
     return res
 
@@ -281,6 +292,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
+                            if any(err in t for err in CANNED_ERRORS):
+                                raise RuntimeError(f"Gemini upstream temporary error: {t}")
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
                             if not t.startswith(emitted_raw_text):
