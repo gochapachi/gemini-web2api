@@ -1,8 +1,9 @@
-"""HTTP server: OpenAI-compatible API endpoints."""
 import json
 import time
 import uuid
 import re
+import queue
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -12,6 +13,41 @@ from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
+SERVER_VERSION = "1.2.0-tunnel-verified"
+
+# Comprehensive Model Catalogue (Ensures Coolify always returns all models in /v1/models)
+ALL_MODELS = {
+    "gemini-3.8-flash": {"mode": 1, "think": 4, "desc": "Latest Google model (Gemini 3.8 Flash with native reasoning)"},
+    "gemini-3.7-flash": {"mode": 1, "think": 4, "desc": "Gemini 3.7 Flash model"},
+    "gemini-3.6-flash": {"mode": 1, "think": 4, "desc": "Gemini 3.6 Flash model"},
+    "gemini-3.1-pro": {"mode": 3, "think": 4, "desc": "Gemini 3.1 Pro (Gemini Advanced Pro model)"},
+    "gemini-3.1-pro-enhanced": {"mode": 3, "think": 4, "extra": {31: 2, 80: 3}, "desc": "Gemini 3.1 Pro Enhanced (expanded response buffers)"},
+    "gemini-auto": {"mode": 4, "think": 4, "desc": "Auto model selection"},
+    "gemini-flash-lite": {"mode": 6, "think": 4, "desc": "Lightweight fast model"},
+    "gemini-flash": {"mode": 1, "think": 4, "desc": "Alias for gemini-3.8-flash"},
+    "gemini-pro": {"mode": 3, "think": 4, "desc": "Alias for gemini-3.1-pro"},
+    "gemini-advanced": {"mode": 3, "think": 4, "desc": "Alias for gemini-3.1-pro (Paid Tier)"},
+    "gemini-2.5-flash": {"mode": 1, "think": 4, "desc": "Legacy alias for Flash"},
+    "gemini-2.5-pro": {"mode": 3, "think": 4, "desc": "Legacy alias for Pro"},
+}
+MODELS.update(ALL_MODELS)
+
+# ─── Reverse Tunnel State ───────────────────────────────────────────────────
+TUNNEL_JOB_QUEUE = queue.Queue()
+TUNNEL_ACTIVE_JOBS = {}
+TUNNEL_WORKERS = {}  # worker_id: last_seen_timestamp
+TUNNEL_LOCK = threading.Lock()
+
+def is_tunnel_worker_active() -> bool:
+    now = time.time()
+    with TUNNEL_LOCK:
+        active = [w for w, t in TUNNEL_WORKERS.items() if (now - t) < 120]
+        return len(active) > 0
+
+def record_worker_heartbeat(worker_id: str):
+    with TUNNEL_LOCK:
+        TUNNEL_WORKERS[worker_id] = time.time()
+
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -44,6 +80,8 @@ def _upload_images(images: list) -> list:
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
@@ -54,15 +92,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+        self.close_connection = True
 
     def _start_sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
 
     def _parse_body(self, body: bytes) -> dict:
         try:
@@ -120,10 +162,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
 
     def do_GET(self):
         try:
+            if self.path == "/_tunnel/status":
+                self.send_json({
+                    "status": "ok",
+                    "tunnel_active": is_tunnel_worker_active(),
+                    "workers": list(TUNNEL_WORKERS.keys())
+                })
+                return
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -140,7 +192,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     for n, c in MODELS.items()
                 ]})
             elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                self.send_json({
+                    "status": "ok",
+                    "version": SERVER_VERSION,
+                    "tunnel_active": is_tunnel_worker_active(),
+                    "models": list(MODELS.keys())
+                })
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -148,10 +205,194 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            # 1. Reverse Tunnel Worker Polling
+            if self.path == "/_tunnel/poll":
+                _ = self._read_request_body()
+                expected_token = CONFIG.get("tunnel_token", "anagata-sec-gemini-2026")
+                auth = self.headers.get("X-Tunnel-Token", "")
+                if auth != expected_token:
+                    self.send_json({"error": "unauthorized tunnel worker"}, 401)
+                    return
+                worker_id = self.headers.get("X-Worker-Id", "default")
+                record_worker_heartbeat(worker_id)
+                try:
+                    job = TUNNEL_JOB_QUEUE.get(timeout=25)
+                    self.send_json({"status": "job", "job": job}, 200)
+                except queue.Empty:
+                    self.send_json({"status": "keepalive"}, 200)
+                return
+
+            # 2. Reverse Tunnel Worker Reply Stream
+            if self.path.startswith("/_tunnel/stream/"):
+                expected_token = CONFIG.get("tunnel_token", "anagata-sec-gemini-2026")
+                auth = self.headers.get("X-Tunnel-Token", "")
+                if auth != expected_token:
+                    self.send_json({"error": "unauthorized tunnel worker"}, 401)
+                    return
+                job_id = self.path[len("/_tunnel/stream/"):]
+                with TUNNEL_LOCK:
+                    resp_q = TUNNEL_ACTIVE_JOBS.get(job_id)
+                if not resp_q:
+                    self.send_json({"error": "job not found"}, 404)
+                    return
+
+                status_code = int(self.headers.get("X-Reply-Status", 200))
+                content_type = self.headers.get("X-Reply-Content-Type", "application/json")
+                resp_q.put(("meta", status_code, content_type))
+
+                transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+                if "chunked" in transfer_encoding:
+                    while True:
+                        line = self.rfile.readline()
+                        if not line:
+                            break
+                        size_hex = line.split(b";", 1)[0].strip()
+                        if not size_hex:
+                            continue
+                        try:
+                            chunk_size = int(size_hex, 16)
+                        except ValueError:
+                            break
+                        if chunk_size == 0:
+                            self.rfile.readline()
+                            break
+                        chunk_data = self.rfile.read(chunk_size)
+                        self.rfile.read(2)
+                        resp_q.put(("chunk", chunk_data))
+                else:
+                    length = int(self.headers.get("Content-Length", 0))
+                    if length > 0:
+                        data = self.rfile.read(length)
+                        resp_q.put(("chunk", data))
+
+                resp_q.put(("done", None))
+                self.send_json({"status": "ok"}, 200)
+                self.close_connection = True
+                return
+
+            # 3. Regular API Authorization
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
+
             body = self._read_request_body()
+
+            # 4. Tunnel Forwarding (if local worker is connected)
+            if is_tunnel_worker_active():
+                job_id = str(uuid.uuid4())
+                resp_q = queue.Queue()
+                with TUNNEL_LOCK:
+                    TUNNEL_ACTIVE_JOBS[job_id] = resp_q
+
+                forward_headers = {
+                    k: v for k, v in self.headers.items()
+                    if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")
+                }
+                job = {
+                    "job_id": job_id,
+                    "method": "POST",
+                    "path": self.path,
+                    "headers": forward_headers,
+                    "body": body.decode("utf-8", errors="replace")
+                }
+                TUNNEL_JOB_QUEUE.put(job)
+
+                is_stream_req = b'"stream": true' in body or b'"stream":true' in body
+                headers_committed = False
+                start_time = time.time()
+                MAX_WAIT_TOTAL = 360  # 6 minutes total headroom
+
+                def write_chunk(data: bytes):
+                    if data:
+                        self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+                        self.wfile.flush()
+
+                def send_keepalive():
+                    if is_stream_req:
+                        write_chunk(b": keepalive\n\n")
+                    else:
+                        write_chunk(b"\n")
+
+                def commit_headers(status: int, content_type: str):
+                    nonlocal headers_committed
+                    if not headers_committed:
+                        self.send_response(status)
+                        self.send_header("Content-Type", content_type)
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.send_header("Connection", "close")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.end_headers()
+                        headers_committed = True
+
+                try:
+                    # 1. Wait for initial response meta from worker
+                    ctype = "text/event-stream" if is_stream_req else "application/json"
+
+                    while True:
+                        time_left = MAX_WAIT_TOTAL - (time.time() - start_time)
+                        if time_left <= 0:
+                            if not headers_committed:
+                                self.send_json({"error": {"message": "Tunnel worker timed out (exceeded 360s)"}}, 504)
+                            return
+
+                        try:
+                            # Poll resp_q with 20s slice to allow keepalive chunking
+                            item = resp_q.get(timeout=min(20.0, time_left))
+                            ev = item[0]
+                            if ev == "meta":
+                                status_code = item[1]
+                                ctype = item[2]
+                                commit_headers(status_code, ctype)
+                                break
+                        except queue.Empty:
+                            # 20s passed without meta (worker is performing long generation)
+                            elapsed = time.time() - start_time
+                            if not headers_committed and elapsed >= 20.0:
+                                # Commit HTTP 200 chunked headers now to prevent Cloudflare/Traefik 100s proxy timeout!
+                                commit_headers(200, ctype)
+
+                            if headers_committed:
+                                try:
+                                    send_keepalive()
+                                except (BrokenPipeError, ConnectionResetError):
+                                    return
+
+                    # 2. Stream chunk loop from worker to client
+                    while True:
+                        time_left = MAX_WAIT_TOTAL - (time.time() - start_time)
+                        if time_left <= 0:
+                            break
+                        try:
+                            ev, chunk = resp_q.get(timeout=min(20.0, time_left))
+                            if ev == "done":
+                                self.wfile.write(b"0\r\n\r\n")
+                                self.wfile.flush()
+                                break
+                            if ev == "chunk" and chunk:
+                                write_chunk(chunk)
+                        except queue.Empty:
+                            if headers_committed:
+                                try:
+                                    send_keepalive()
+                                except (BrokenPipeError, ConnectionResetError):
+                                    return
+                    self.close_connection = True
+                    return
+                finally:
+                    with TUNNEL_LOCK:
+                        TUNNEL_ACTIVE_JOBS.pop(job_id, None)
+
+            # 5. Fallback if no tunnel worker is active
+            if CONFIG.get("tunnel_only", True):
+                self.send_json({
+                    "error": {
+                        "message": "Gemini local bridge is offline. Please launch start_gemini_service.bat on your PC.",
+                        "code": "tunnel_worker_offline"
+                    }
+                }, 503)
+                return
+
             if self.path == "/v1/chat/completions":
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
@@ -171,6 +412,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except:
                 pass
 
+
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
     def _handle_chat(self, body: bytes):
@@ -187,11 +429,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
         prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        stream = req.get("stream", False)
+        log(f">> [Incoming Chat] Model: '{req.get('model')}' -> Resolved: '{model_name}' (mode: {model_id}, think: {think_mode}), stream: {stream}, tools: {len(tools) if tools else 0}, prompt: {len(prompt)} chars")
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
-        stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         try:
             file_refs = _upload_images(images)
@@ -233,7 +476,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            log(f"<< [Gemini Response] Model: '{model_name}', length: {len(text or '')}, preview: {(text or '')[:150]!r}")
         except Exception as e:
+            log(f"<< [Gemini Error] Model: '{model_name}', error: {e}")
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 

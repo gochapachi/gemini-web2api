@@ -22,11 +22,20 @@ _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
 
 
+LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gemini_api.log")
+
 def log(msg: str):
-    if CONFIG["log_requests"]:
+    if CONFIG.get("log_requests", True):
+        ts = time.strftime('%H:%M:%S')
+        line = f"[{ts}] {msg}\n"
         import sys
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        sys.stderr.write(line)
         sys.stderr.flush()
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
 
 
 def _get_ssl_ctx():
@@ -60,6 +69,12 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            if data.get("xsrf_token"):
+                CONFIG["xsrf_token"] = data["xsrf_token"]
+            if data.get("gemini_bl"):
+                CONFIG["gemini_bl"] = data["gemini_bl"]
+            if data.get("auth_user") is not None:
+                CONFIG["auth_user"] = data["auth_user"]
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -199,7 +214,10 @@ def extract_response_text(raw: str) -> str:
         for t in _extract_texts_from_line(line):
             if len(t) > len(last_text):
                 last_text = t
-    return clean_text(last_text)
+    res = clean_text(last_text)
+    if "Sorry, something went wrong" in res:
+        raise RuntimeError(f"Gemini upstream temporary error: {res}")
+    return res
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:

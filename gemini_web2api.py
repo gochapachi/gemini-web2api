@@ -71,37 +71,55 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    # ─── Google Gemini Active Models ───────────────────────────────────────
+    "gemini-3.8-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Latest Google model (Gemini 3.8 Flash with native reasoning)",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.7 Flash)",
+        "desc": "Gemini 3.7 Flash model",
     },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4,
-        "desc": "All-around model (Gemini 3.6 Flash)",
-    },
-    "gemini-3.5-flash": {
-        "mode": 1, "think": 4,
-        "desc": "Alias for gemini-3.6-flash (backend upgraded)",
-    },
-    "gemini-3.5-flash-thinking": {
-        "mode": 2, "think": 0,
-        "desc": "Deep thinking mode, longest output (~20k chars)",
+        "desc": "Gemini 3.6 Flash model",
     },
     "gemini-3.1-pro": {
         "mode": 3, "think": 4,
-        "desc": "Pro model (requires cookie for real routing)",
+        "desc": "Gemini 3.1 Pro (Gemini Advanced Pro model)",
+    },
+    "gemini-3.1-pro-enhanced": {
+        "mode": 3, "think": 4, "extra": {31: 2, 80: 3},
+        "desc": "Gemini 3.1 Pro Enhanced (expanded response buffers)",
     },
     "gemini-auto": {
         "mode": 4, "think": 4,
         "desc": "Auto model selection",
     },
-    "gemini-3.5-flash-thinking-lite": {
-        "mode": 5, "think": 0,
-        "desc": "Dynamic thinking with adaptive depth",
-    },
     "gemini-flash-lite": {
         "mode": 6, "think": 4,
         "desc": "Lightweight fast model",
+    },
+    # ─── Convenience Aliases ──────────────────────────────────────────────
+    "gemini-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Alias for gemini-3.8-flash",
+    },
+    "gemini-pro": {
+        "mode": 3, "think": 4,
+        "desc": "Alias for gemini-3.1-pro",
+    },
+    "gemini-advanced": {
+        "mode": 3, "think": 4,
+        "desc": "Alias for gemini-3.1-pro (Paid Tier)",
+    },
+    "gemini-2.5-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Legacy alias for Flash",
+    },
+    "gemini-2.5-pro": {
+        "mode": 3, "think": 4,
+        "desc": "Legacy alias for Pro",
     },
 }
 

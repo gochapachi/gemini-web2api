@@ -4,6 +4,14 @@ config.json
 cookie.txt
 cookie.json
 .env
+.venv/
 .idea
 .DS_Store
 gemini-auth.json
+*.log
+freebuff-repo/
+identity_test.json
+probe_model.json
+test_*.json
+test_*.py
+test_req.json

@@ -17,6 +17,8 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "tunnel_token": "anagata-sec-gemini-2026",
+    "tunnel_only": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
